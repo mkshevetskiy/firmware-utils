@@ -172,6 +172,7 @@ bool use_guid_partition_table = false;
 struct partinfo parts[GPT_ENTRY_MAX];
 char *filename = NULL;
 
+int gpt_full_image = false;
 int gpt_alternate = false;
 uint64_t gpt_first_entry_sector = GPT_FIRST_ENTRY_SECTOR;
 uint64_t gpt_last_usable_sector = 0;
@@ -424,6 +425,7 @@ static int gen_gptable(uint32_t signature, guid_t guid, unsigned nr)
 	uint64_t sect = GPT_SIZE + gpt_first_entry_sector;
 	int fd, ret = -1;
 	unsigned i, pmbr = 1;
+	char img_name[strlen(filename) + 20];
 
 	memset(pte, 0, sizeof(struct pte) * MBR_ENTRY_MAX);
 	memset(gpte, 0, GPT_ENTRY_SIZE * GPT_ENTRY_MAX);
@@ -518,8 +520,13 @@ static int gen_gptable(uint32_t signature, guid_t guid, unsigned nr)
 		fprintf(stderr, "PartitionEntryLBA=%" PRIu64 ", FirstUsableLBA=%" PRIu64 ", LastUsableLBA=%" PRIu64 "\n",
 				gpt_first_entry_sector, gpt_first_entry_sector + GPT_SIZE, gpt_last_usable_sector);
 
-	if ((fd = open(filename, O_WRONLY|O_CREAT|O_TRUNC, 0644)) < 0) {
-		fprintf(stderr, "Can't open output file '%s'\n",filename);
+	if (!gpt_full_image)
+		snprintf(img_name, sizeof(img_name), "%s.start", filename);
+	else
+		strcpy(img_name, filename);
+
+	if ((fd = open(img_name, O_WRONLY|O_CREAT|O_TRUNC, 0644)) < 0) {
+		fprintf(stderr, "Can't open output file '%s'\n",img_name);
 		return ret;
 	}
 
@@ -546,7 +553,24 @@ static int gen_gptable(uint32_t signature, guid_t guid, unsigned nr)
 		goto fail;
 	}
 
-	lseek(fd, gpt_first_entry_sector * DISK_SECTOR_SIZE, SEEK_SET);
+	lseek(fd, 2 * DISK_SECTOR_SIZE - 1, SEEK_SET);
+	if (write(fd, "\x00", 1) != 1) {
+		fputs("write failed.\n", stderr);
+		goto fail;
+	}
+
+	if ((gpt_first_entry_sector == GPT_FIRST_ENTRY_SECTOR) || gpt_full_image) {
+		lseek(fd, gpt_first_entry_sector * DISK_SECTOR_SIZE, SEEK_SET);
+	} else {
+		close(fd);
+
+		snprintf(img_name, sizeof(img_name), "%s.entry", filename);
+		if ((fd = open(img_name, O_WRONLY|O_CREAT|O_TRUNC, 0644)) < 0) {
+			fprintf(stderr, "Can't open output file '%s'\n",img_name);
+			return ret;
+		}
+	}
+
 	if (write(fd, &gpte, GPT_ENTRY_SIZE * GPT_ENTRY_MAX) != GPT_ENTRY_SIZE * GPT_ENTRY_MAX) {
 		fputs("write failed.\n", stderr);
 		goto fail;
@@ -561,7 +585,19 @@ static int gen_gptable(uint32_t signature, guid_t guid, unsigned nr)
 	gpth.crc32 = 0;
 	gpth.crc32 = cpu_to_le32(gpt_crc32(&gpth, GPT_HEADER_SIZE));
 
-	lseek(fd, end * DISK_SECTOR_SIZE - GPT_ENTRY_SIZE * GPT_ENTRY_MAX, SEEK_SET);
+	if (gpt_full_image) {
+		lseek(fd, end * DISK_SECTOR_SIZE - GPT_ENTRY_SIZE * GPT_ENTRY_MAX, SEEK_SET);
+	} else {
+		close(fd);
+
+		end = GPT_SIZE;
+		snprintf(img_name, sizeof(img_name), "%s.end", filename);
+		if ((fd = open(img_name, O_WRONLY|O_CREAT|O_TRUNC, 0644)) < 0) {
+			fprintf(stderr, "Can't open output file '%s'\n",img_name);
+			return ret;
+		}
+	}
+
 	if (write(fd, &gpte, GPT_ENTRY_SIZE * GPT_ENTRY_MAX) != GPT_ENTRY_SIZE * GPT_ENTRY_MAX) {
 		fputs("write failed.\n", stderr);
 		goto fail;
@@ -588,7 +624,7 @@ fail:
 
 static void usage(char *prog)
 {
-	fprintf(stderr, "Usage: %s [-v] [-n] [-g] -h <heads> -s <sectors> -o <outputfile>\n"
+	fprintf(stderr, "Usage: %s [-v] [-n] [-b] [-g] -h <heads> -s <sectors> -o <outputfile>\n"
 			"          [-a <part number>] [-l <align kB>] [-G <guid>]\n"
 			"          [-e <gpt_entry_offset>] [-d <gpt_disk_size>]\n"
 			"          [[-t <type> | -T <GPT part type>] [-r] [-N <name>] -p <size>[@<start>]...] \n", prog);
@@ -630,7 +666,7 @@ int main (int argc, char **argv)
 	guid_t guid = GUID_INIT( signature, 0x2211, 0x4433, \
 			0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0x00);
 
-	while ((ch = getopt(argc, argv, "h:s:p:a:t:T:o:vnHN:gl:rS:G:e:d:")) != -1) {
+	while ((ch = getopt(argc, argv, "h:s:p:a:t:T:o:vnbHN:gl:rS:G:e:d:")) != -1) {
 		switch (ch) {
 		case 'o':
 			filename = optarg;
@@ -663,6 +699,7 @@ int main (int argc, char **argv)
 			break;
 		case 'd':
 			gpt_alternate = true;
+			gpt_full_image = true;
 			disk_size = (uint64_t)strtoull(optarg, NULL, 0);
 			if (disk_size % DISK_SECTOR_SIZE != 0) {
 				fprintf(stderr, "GPT disk size must be divided to %d\n",
@@ -675,6 +712,10 @@ int main (int argc, char **argv)
 				exit(EXIT_FAILURE);
 			}
 			gpt_last_usable_sector = disk_size / DISK_SECTOR_SIZE - GPT_SIZE - 2;
+			break;
+		case 'b':
+			gpt_alternate = true;
+			gpt_full_image = false;
 			break;
 		case 'h':
 			heads = (int)strtoul(optarg, NULL, 0);
